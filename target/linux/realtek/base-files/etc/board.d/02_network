@@ -27,7 +27,7 @@ realtek_setup_interfaces()
 	bt-pon,bt-g711ax)
 		ucidef_set_interface_lan "$lan_list"
 		;;
-	buffalo,wsr-1500ax2s)
+	buffalo,wsr-1500ax2s|t20pro)
 		ucidef_set_interfaces_lan_wan "$lan_list" "wan"
 		;;
 	*)
@@ -138,6 +138,12 @@ realtek_setup_macs()
 	local label_mac=""
 
 	case $board in
+	t20pro)
+		lan_mac=$(realtek_get_mac_xml /tmp/ubi_factory/config_hs.xml ELAN_MAC_ADDR)
+		eth0_mac=$lan_mac
+		label_mac=$lan_mac
+		[ -z "$lan_mac" ] || ucidef_set_interface_macaddr "wan" "$(macaddr_add "$lan_mac" 1)"
+		;;
 	allnet,all-sg8208m|\
 	apresia,aplgs120gtss|\
 	d-link,dgs-1210-10mp-f|\

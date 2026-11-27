@@ -1,0 +1,99 @@
+Subject: wifi: rtw89: 8852a: support the TCL T20 Pro radios
+
+The TCL T20 Pro stores calibration data in its factory volume. Fall back
+to the logical eFuse map supplied by userspace when the on-chip map lacks
+a valid MAC address or RFE type. Restrict each radio to the band wired on
+the board: 5 GHz on PCI domain 0 and 2.4 GHz on domain 1.
+
+--- a/drivers/net/wireless/realtek/rtw89/rtw8852a.c
++++ b/drivers/net/wireless/realtek/rtw89/rtw8852a.c
+@@ -2,6 +2,11 @@
+ /* Copyright(c) 2019-2020  Realtek Corporation
+  */
+ 
++#include <linux/firmware.h>
++#include <linux/of.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++
+ #include "coex.h"
+ #include "fw.h"
+ #include "mac.h"
+@@ -700,12 +705,77 @@
+ 	}
+ }
+ 
++static int rtw8852a_load_t20pro_efuse(struct rtw89_dev *rtwdev, u8 *log_map)
++{
++	struct rtw8852a_efuse *map = (struct rtw8852a_efuse *)log_map;
++	const struct firmware *fw;
++	char name[48];
++	int ret;
++
++	if (rtwdev->hci.type != RTW89_HCI_TYPE_PCIE ||
++	    !of_machine_is_compatible("t20pro") ||
++	    (is_valid_ether_addr(map->e.mac_addr) && map->rfe_type != 0xff))
++		return 0;
++
++	snprintf(name, sizeof(name), "rtw89/t20pro-8852ae-%d.bin",
++		 pci_domain_nr(to_pci_dev(rtwdev->dev)->bus));
++	ret = request_firmware_direct(&fw, name, rtwdev->dev);
++	if (ret)
++		return ret;
++	if (fw->size != rtwdev->chip->logical_efuse_size) {
++		ret = -EINVAL;
++	} else {
++		memcpy(log_map, fw->data, fw->size);
++		if (!is_valid_ether_addr(map->e.mac_addr) || map->rfe_type == 0xff)
++			ret = -EINVAL;
++	}
++	release_firmware(fw);
++	return ret;
++}
++
++static int rtw8852a_t20pro_set_band(struct rtw89_dev *rtwdev)
++{
++	struct rtw89_chip_info *chip;
++	int domain;
++	u8 bands;
++
++	if (rtwdev->hci.type != RTW89_HCI_TYPE_PCIE ||
++	    !of_machine_is_compatible("t20pro"))
++		return 0;
++
++	/* The two identical chips are connected to different RF paths. */
++	domain = pci_domain_nr(to_pci_dev(rtwdev->dev)->bus);
++	if (domain == 0)
++		bands = BIT(NL80211_BAND_5GHZ);
++	else if (domain == 1)
++		bands = BIT(NL80211_BAND_2GHZ);
++	else
++		return -EINVAL;
++
++	if (rtwdev->chip->support_bands == bands)
++		return 0;
++	chip = devm_kmemdup(rtwdev->dev, rtwdev->chip, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++	chip->support_bands = bands;
++	rtwdev->chip = chip;
++
++	return 0;
++}
++
+ static int rtw8852a_read_efuse(struct rtw89_dev *rtwdev, u8 *log_map,
+ 			       enum rtw89_efuse_block block)
+ {
+ 	struct rtw89_efuse *efuse = &rtwdev->efuse;
+ 	struct rtw8852a_efuse *map;
++	int ret;
+ 
++	ret = rtw8852a_load_t20pro_efuse(rtwdev, log_map);
++	if (ret)
++		return ret;
++	ret = rtw8852a_t20pro_set_band(rtwdev);
++	if (ret)
++		return ret;
+ 	map = (struct rtw8852a_efuse *)log_map;
+ 
+ 	efuse->country_code[0] = map->country_code[0];

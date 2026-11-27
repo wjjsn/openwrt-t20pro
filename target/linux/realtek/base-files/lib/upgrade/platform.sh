@@ -1,7 +1,7 @@
 PART_NAME=firmware
 REQUIRE_IMAGE_METADATA=1
 
-RAMFS_COPY_BIN='ubicrc32'
+RAMFS_COPY_BIN='ubicrc32 mktemp'
 
 # The TP-Link bootloader gets its flash layout from "bootargs".
 # Use this to our advantage, and:
@@ -72,12 +72,84 @@ buffalo_wsr1500ax2s_do_upgrade() {
 	nand_do_upgrade_failed
 }
 
+t20pro_extract_upgrade() {
+	local image="$1" dir="$2" size
+	local archive=sysupgrade-t20pro
+
+	tar -xOf "$image" "$archive/CONTROL" >/dev/null || return 1
+	tar -xOf "$image" "$archive/kernel" > "$dir/kernel" || return 1
+	tar -xOf "$image" "$archive/root" > "$dir/root" || return 1
+	[ "$(get_magic_long "$dir/kernel")" = 27051956 ] || return 1
+	[ "$(identify "$dir/root" cat)" = squashfs ] || return 1
+	size=$(wc -c < "$dir/kernel")
+	[ "$size" -gt 64 ] && [ "$size" -le 6291456 ] &&
+		[ "$(wc -c < "$dir/root")" -le 16252928 ]
+}
+
+t20pro_flash_upgrade() {
+	local dir="$1" ubi kernel root data volume mtd
+
+	CI_UBIPART=ubi_device
+	ubi=$(nand_find_ubi "$CI_UBIPART")
+	[ -n "$ubi" ] || return 1
+	mtd=$(cat "/sys/class/ubi/$ubi/mtd_num")
+	[ "$(cat "/sys/class/mtd/mtd$mtd/offset")" = 1048576 ] || return 1
+	[ "$(cat "/sys/class/mtd/mtd$mtd/size")" = 130547712 ] || return 1
+	[ "$(cat "/sys/class/ubi/$ubi/ro_mode")" = 0 ] || return 1
+	kernel=$(nand_find_volume "$ubi" ubi_k1)
+	root=$(nand_find_volume "$ubi" ubi_r1)
+	data=$(nand_find_volume "$ubi" rootfs_data)
+	[ "$kernel" = "${ubi}_3" ] && [ "$root" = "${ubi}_4" ] || return 1
+	for volume in "$kernel" "$root"; do
+		[ "$(cat "/sys/class/ubi/$volume/type")" = dynamic ] || return 1
+	done
+	[ "$(wc -c < "$dir/kernel")" -le "$(cat "/sys/class/ubi/$kernel/data_bytes")" ] || return 1
+	[ "$(wc -c < "$dir/root")" -le "$(cat "/sys/class/ubi/$root/data_bytes")" ] || return 1
+
+	# Keep the OEM boot volume IDs unchanged. Never run UBI auto-format.
+	nand_remove_ubiblock "$root" || return 1
+	ubiupdatevol "/dev/$root" "$dir/root" || return 1
+	# Reserve room for future system images and release the rest to the overlay.
+	if [ "$(cat "/sys/class/ubi/$root/reserved_ebs")" -gt 128 ]; then
+		ubirsvol "/dev/$ubi" -N ubi_r1 -s 16252928 || return 1
+	fi
+	if [ -n "$data" ]; then
+		ubiupdatevol -t "/dev/$data" || return 1
+	else
+		ubimkvol "/dev/$ubi" -N rootfs_data -m || return 1
+	fi
+	ubiupdatevol "/dev/$kernel" "$dir/kernel"
+}
+
+t20pro_do_upgrade() {
+	local dir
+
+	dir=$(mktemp -d /tmp/t20pro-upgrade.XXXXXX) || {
+		nand_do_upgrade_failed
+		return 1
+	}
+	if t20pro_extract_upgrade "$1" "$dir" && t20pro_flash_upgrade "$dir"; then
+		rm -r "$dir"
+		nand_do_upgrade_success
+	else
+		rm -r "$dir"
+		nand_do_upgrade_failed
+	fi
+}
+
 platform_check_image() {
-	local board=$(board_name)
+	local board=$(board_name) dir status
 
 	case "$board" in
 	draytek,g2282x)
 		draytek_g2282x_set_part_name || return 1
+		;;
+	t20pro)
+		dir=$(mktemp -d /tmp/t20pro-upgrade.XXXXXX) || return 1
+		t20pro_extract_upgrade "$1" "$dir"
+		status=$?
+		rm -r "$dir"
+		return "$status"
 		;;
 	esac
 
@@ -105,6 +177,9 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
+	t20pro)
+		t20pro_do_upgrade "$1"
+		;;
 	buffalo,wsr-1500ax2s)
 		buffalo_wsr1500ax2s_do_upgrade "$1"
 		;;
